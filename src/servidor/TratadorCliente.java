@@ -42,16 +42,20 @@ public class TratadorCliente implements Runnable {
             if (linha.startsWith("/cadastrar ")) {
                 String nomeTentativa = linha.substring(11).trim();
 
-                if (nomeTentativa.isEmpty() || clientesConectados.containsKey(nomeTentativa)) {
-                    saida.writeBoolean(false);
-                    saida.flush();
-                } else {
-                    this.nomeCliente = nomeTentativa;
-                    clientesConectados.put(nomeCliente, socket);
+                boolean sucesso = !nomeTentativa.isEmpty()
+                        && clientesConectados.putIfAbsent(nomeTentativa, socket) == null;
 
-                    saida.writeBoolean(true);
-                    saida.flush();
-                    System.out.println("Cliente cadastrado: " + nomeCliente + " [" + socket.getInetAddress().getHostAddress() + "]");
+                if (sucesso) {
+                    this.nomeCliente = nomeTentativa;
+                }
+
+                saida.writeBoolean(sucesso);
+                saida.flush();
+
+                if (sucesso) {
+                    String ip = socket.getInetAddress().getHostAddress();
+                    System.out.println("Cliente cadastrado: " + nomeCliente + " [" + ip + "]");
+                    Servidor.registrarConexao(nomeCliente, ip);
                     break;
                 }
             }
@@ -78,8 +82,7 @@ public class TratadorCliente implements Runnable {
         for (String key : clientesConectados.keySet()) {
             users.append("- ").append(key).append("\n");
         }
-        saida.writeUTF("/msg " + users.toString());
-        saida.flush();
+        enviarParaMim("/msg " + users);
     }
 
     private void rotearEnvio(String comando) throws IOException {
@@ -91,8 +94,7 @@ public class TratadorCliente implements Runnable {
         Socket sockDest = clientesConectados.get(destinatario);
 
         if (sockDest == null) {
-            saida.writeUTF("/msg Usuário '" + destinatario + "' não encontrado.");
-            saida.flush();
+            enviarParaMim("/msg Usuário '" + destinatario + "' não encontrado.");
 
             if (subComando.equalsIgnoreCase("file")) {
                 descartarArquivoRemetente();
@@ -100,37 +102,53 @@ public class TratadorCliente implements Runnable {
             return;
         }
 
-        var saidaDest = new DataOutputStream(sockDest.getOutputStream());
-
-        if (subComando.equalsIgnoreCase("message") && partes.length >= 4) {
-            enviarMensagemTexto(saidaDest, partes[3]);
-        } else if (subComando.equalsIgnoreCase("file")) {
-            repassarArquivo(saidaDest);
+        try {
+            if (subComando.equalsIgnoreCase("message") && partes.length >= 4) {
+                enviarMensagemTexto(sockDest, partes[3]);
+            } else if (subComando.equalsIgnoreCase("file")) {
+                repassarArquivo(sockDest);
+            }
+        } catch (IOException e) {
+            // Falha ao escrever no socket do destinatário não pode derrubar
+            // a conexão de quem está enviando.
+            System.err.println("Falha ao entregar para " + destinatario + ": " + e.getMessage());
+            enviarParaMim("/msg Falha ao entregar mensagem para '" + destinatario + "'.");
         }
     }
 
-    private void enviarMensagemTexto(DataOutputStream saidaDest, String mensagem) throws IOException {
-        saidaDest.writeUTF("/msg " + nomeCliente + ": " + mensagem);
-        saidaDest.flush();
+    private void enviarMensagemTexto(Socket sockDest, String mensagem) throws IOException {
+        // Mutex: sincroniza no próprio Socket de destino, serializando
+        // escritas concorrentes que podem vir de várias threads de clientes.
+        synchronized (sockDest) {
+            var saidaDest = new DataOutputStream(sockDest.getOutputStream());
+            saidaDest.writeUTF("/msg " + nomeCliente + ": " + mensagem);
+            saidaDest.flush();
+        }
     }
 
-    private void repassarArquivo(DataOutputStream saidaDest) throws IOException {
+    private void repassarArquivo(Socket sockDest) throws IOException {
         String nomeArquivo = entrada.readUTF();
         long tamanho = entrada.readLong();
 
-        saidaDest.writeUTF("/file " + nomeCliente + " " + nomeArquivo);
-        saidaDest.writeLong(tamanho);
+        // Mutex: mantém o cabeçalho e os bytes do arquivo como uma única
+        // escrita atômica no socket de destino, evitando que outra
+        // mensagem/arquivo se intercale no meio da transferência.
+        synchronized (sockDest) {
+            var saidaDest = new DataOutputStream(sockDest.getOutputStream());
+            saidaDest.writeUTF("/file " + nomeCliente + " " + nomeArquivo);
+            saidaDest.writeLong(tamanho);
 
-        byte[] buffer = new byte[4096];
-        long restante = tamanho;
+            byte[] buffer = new byte[4096];
+            long restante = tamanho;
 
-        while (restante > 0) {
-            int lidos = entrada.read(buffer, 0, (int) Math.min(buffer.length, restante));
-            if (lidos == -1) break;
-            saidaDest.write(buffer, 0, lidos);
-            restante -= lidos;
+            while (restante > 0) {
+                int lidos = entrada.read(buffer, 0, (int) Math.min(buffer.length, restante));
+                if (lidos == -1) break;
+                saidaDest.write(buffer, 0, lidos);
+                restante -= lidos;
+            }
+            saidaDest.flush();
         }
-        saidaDest.flush();
     }
 
     private void descartarArquivoRemetente() throws IOException {
@@ -143,6 +161,13 @@ public class TratadorCliente implements Runnable {
             int lidos = entrada.read(buffer, 0, (int) Math.min(buffer.length, restante));
             if (lidos == -1) break;
             restante -= lidos;
+        }
+    }
+
+    private void enviarParaMim(String mensagem) throws IOException {
+        synchronized (socket) {
+            saida.writeUTF(mensagem);
+            saida.flush();
         }
     }
 
